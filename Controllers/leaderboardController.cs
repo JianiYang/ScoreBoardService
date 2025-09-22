@@ -59,7 +59,7 @@ public class leaderboardController : ControllerBase
             });
             return Ok(result);
         }
-        catch (ArgumentException e)
+        catch (KeyNotFoundException e)
         {
             return BadRequest(e.Message);
         }
