@@ -20,23 +20,27 @@ public class SortedScoreBoard
 
     public static SortedScoreBoard Instance => _instance.Value;
 
-    private readonly SortedSet<CustomerScore> _set = new SortedSet<CustomerScore>();
-
-    private ConcurrentDictionary<long, int> _idToIndexMap; // ID -> Index  
+    private Dictionary<long, decimal> _idValueMap; // ID -> Value  
 
     private readonly ReaderWriterLockSlim _lock = new ReaderWriterLockSlim();
 
     private List<CustomerScore> _cache;
 
-    private bool isChacheNeedRefresh = false;
-
     private int lastRanking = 0;
+
+    private int _addOrUpdateCount = 0;
+
+    private DateTime _lastAddOrUpdateTime = new DateTime();
+
+    private TimeSpan _updateCacheTimer = new TimeSpan(50);
+
+    private int _updateCacheCount = 1000;
 
     private SortedScoreBoard()
     {
-        _set = new SortedSet<CustomerScore>(new CustomerScoreComparer());
-        _idToIndexMap = new ConcurrentDictionary<long, int>();
+        _idValueMap = new Dictionary<long, decimal>();
         _lock = new ReaderWriterLockSlim();
+        InitializeUpdateCacheTimer();
     }
 
     /// <summary>
@@ -53,12 +57,7 @@ public class SortedScoreBoard
         _lock.EnterReadLock();
         try
         {
-            if (this.isChacheNeedRefresh)
-            {
-                _cache = _set.ToList();
-                this.isChacheNeedRefresh = false;
-            }
-            int totalCount = Math.Min(_set.Count, this.lastRanking);
+            int totalCount = Math.Min(_cache.Count, this.lastRanking);
             if (start >= totalCount) throw new ArgumentOutOfRangeException(nameof(start), "Start index out of ranking range.");
             if (end >= totalCount) end = totalCount - 1; // end should not more than set range.
 
@@ -95,21 +94,15 @@ public class SortedScoreBoard
         _lock.EnterReadLock();
         try
         {
-            if (this.isChacheNeedRefresh)
-            {
-                _cache = _set.ToList();
-                this.isChacheNeedRefresh = false;
-            }
             var index = GetIndexById(customerId);
             if (index == -1 || index >= this.lastRanking)
             {
-                throw new KeyNotFoundException($"Customer {customerId} does not exist in the ranking board.");
+                startIndex = -1;
+                return new List<object>();
             }
-
-
             // Caculate the real start and end
             startIndex = Math.Max(0, index - high);
-            int endIndex = Math.Min(_set.Count - 1, index + low);
+            int endIndex = Math.Min(_cache.Count - 1, index + low);
             
             var subList = _cache.GetRange(startIndex, endIndex - startIndex + 1);
 
@@ -130,6 +123,44 @@ public class SortedScoreBoard
         }
     }
 
+    private int GetIndexById(long customerId)
+    {
+        if (_cache == null || _cache.Count == 0)
+            return -1;
+
+        // use id get score for binary search
+        if (!_idValueMap.TryGetValue(customerId, out decimal score))
+            return -1;
+
+        int left = 0, right = _cache.Count - 1;
+        while (left <= right)
+        {
+            int mid = left + (right - left) / 2;
+            var midCustomer = _cache[mid];
+
+            if (midCustomer.CustomerId == customerId)
+                return mid;
+
+            if (midCustomer.Score > score ||
+            (midCustomer.Score == score && midCustomer.CustomerId < customerId))
+            {
+                left = mid + 1;
+            }
+            else
+            {
+                right = mid - 1;
+            }
+        }
+        // If not found by binary search, traverse to find it (fallback)
+        for (int i = 0; i < _cache.Count; i++)
+        {
+            if (_cache[i].CustomerId == customerId)
+            return i;
+        }
+        return -1;
+    }
+
+
     /// <summary>
     /// Adds a key-value pair to the cache if the key does not exist,
     /// or updates the value if the key already exists. 
@@ -143,67 +174,75 @@ public class SortedScoreBoard
         _lock.EnterUpgradeableReadLock();
         try
         {
-            this.isChacheNeedRefresh = true;
-            var index = GetIndexById(customerId);
-            if (index != -1)
+            if (_idValueMap.ContainsKey(customerId))
             {
-                _lock.EnterWriteLock();
-                try
-                {
-                    var currenCustomerScore = _set.ElementAt(index);
-                    _set.Remove(currenCustomerScore);
-                    currenCustomerScore.Score += score;
-                    _set.Add(currenCustomerScore);
-                    UpdateAllIndexes();
-                    return currenCustomerScore.Score;
-                }
-                finally
-                {
-                    _lock.ExitWriteLock();
-                }
+                _idValueMap[customerId] += score;
+                return _idValueMap[customerId];
             }
             else
             {
-                _lock.EnterWriteLock();
-                try
-                {
-                    _set.Add(new CustomerScore(customerId, score));
-                    UpdateAllIndexes();
-                    return score;
-                }
-                finally
-                {
-                    _lock.ExitWriteLock();
-                }
-
+                _idValueMap[customerId] = score;
+                return _idValueMap[customerId];
             }
         }
         finally
         {
+            TriggerUpdateCache();
             _lock.ExitUpgradeableReadLock();
         }
     }
+ 
 
-    public int GetIndexById(long customerId)
+    private void InitializeUpdateCacheTimer()
     {
-        if (_idToIndexMap.TryGetValue(customerId, out int index))
+        new Timer(_ =>
         {
-            return index;
-        }
-        return -1;
-    }
-
-    private void UpdateAllIndexes()
-    {
-        _idToIndexMap.Clear();
-        int index = 0;
-        foreach (var item in _set)
-        {
-            if (item.Score <= 0)
+            if (_addOrUpdateCount > 0 && (DateTime.UtcNow - _lastAddOrUpdateTime).TotalMilliseconds >= _updateCacheTimer.TotalMilliseconds)
             {
-                this.lastRanking = index;
+                UpdateCache();
+                _addOrUpdateCount = 0;
             }
-            _idToIndexMap[item.CustomerId] = index++;
+        }, null, 50, 50);
+    }
+
+    private void TriggerUpdateCache()
+    {
+        _addOrUpdateCount++;
+        if (_addOrUpdateCount >= _updateCacheCount)
+        {
+            UpdateCache();
+            _lastAddOrUpdateTime = DateTime.UtcNow;
+            _addOrUpdateCount = 0;
         }
     }
+
+    
+    /// <summary>
+    /// Updates the cache by transferring _idValueMap to a sorted list of CustomerScore.
+    /// </summary>
+    private void UpdateCache()
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            var customerScores = _idValueMap
+                .Select(kvp => new CustomerScore(kvp.Key, kvp.Value))
+                .ToList();
+            customerScores.Sort(new CustomerScoreComparer());
+
+            // Set lastRanking to the first index where Score <= 0
+            this.lastRanking = customerScores.FindIndex(cs => cs.Score <= 0);
+            if (this.lastRanking == -1)
+            {
+                this.lastRanking = customerScores.Count;
+            }
+
+            _cache = customerScores;
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+
 }
