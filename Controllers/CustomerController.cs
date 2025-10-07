@@ -17,19 +17,25 @@ public class CustomerControllerController : ControllerBase
     /// Must be within the range [-1000, +1000].
     /// </param>
     /// <returns>
-    /// An <see cref="ActionResult{decimal}"/> containing a message with the updated score,
-    /// or a <see cref="BadRequestResult"/> if the score is out of range.
+    /// An <see cref="ActionResult{string}"/> containing a message with the updated score,
+    /// or a <see cref="BadRequestObjectResult"/> if the score is out of range.
     /// </returns>
     [HttpPost("{customerId:long}/score/{score:decimal}")]
-    public ActionResult<decimal> UpdateScore(long customerId, decimal score)
+    public ActionResult<string> UpdateScore(long customerId, decimal score)
     {
-        // score range [-1000, +1000]
         if (score < -1000 || score > 1000)
         {
             return BadRequest("Score must be between -1000 and +1000.");
         }
+
         var cache = SortedScoreBoard.Instance;
-        var newScore = cache.AddOrUpdate(customerId, score);
-        return Ok($"User {customerId} has been set to new score {newScore}.");
+        bool isChanged = cache.AddOrUpdate(customerId, score, out string message);
+
+        if (!isChanged)
+        {
+            return BadRequest("Failed to update score. " + message);
+        }
+
+        return Ok(message);
     }
 }
